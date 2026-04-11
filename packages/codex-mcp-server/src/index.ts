@@ -31,15 +31,38 @@ function runCodex(prompt: string): Promise<string> {
     }
     cmd += ` -q ${shellEscape(prompt)}`;
 
-    exec(cmd, {
+    const proc = exec(cmd, {
       timeout: TIMEOUT_MS,
+      killSignal: "SIGTERM",
       windowsHide: true,
     }, (error, stdout, stderr) => {
       if (error) {
-        reject(new Error(`Codex error: ${stderr.trim() || error.message}`));
+        if (error.killed) {
+          reject(new Error(
+            `[CODEX TIMEOUT] Process killed after ${TIMEOUT_MS / 1000}s. ` +
+            `The task was too long for the current timeout. ` +
+            `Partial output:\n${stdout.trim().slice(-500) || "(none)"}`
+          ));
+        } else if (error.signal) {
+          reject(new Error(
+            `[CODEX CRASHED] Process terminated by signal ${error.signal}. ` +
+            `stderr: ${stderr.trim().slice(-500) || "(none)"}`
+          ));
+        } else {
+          reject(new Error(
+            `[CODEX ERROR] Exit code ${error.code}. ` +
+            `${stderr.trim().slice(-500) || error.message}`
+          ));
+        }
       } else {
         resolve(stdout.trim());
       }
+    });
+
+    proc.on("error", (err) => {
+      reject(new Error(
+        `[CODEX SPAWN FAILED] Could not start codex: ${err.message}`
+      ));
     });
   });
 }

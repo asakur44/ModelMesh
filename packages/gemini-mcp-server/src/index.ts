@@ -35,15 +35,38 @@ function runGemini(prompt: string, model?: string): Promise<string> {
     }
     cmd += ` -p ${shellEscape(prompt)}`;
 
-    exec(cmd, {
+    const proc = exec(cmd, {
       timeout: TIMEOUT_MS,
+      killSignal: "SIGTERM",
       windowsHide: true,
     }, (error, stdout, stderr) => {
       if (error) {
-        reject(new Error(`Gemini error: ${stderr.trim() || error.message}`));
+        if (error.killed) {
+          reject(new Error(
+            `[GEMINI TIMEOUT] Process killed after ${TIMEOUT_MS / 1000}s. ` +
+            `The task was too long for the current timeout. ` +
+            `Partial output:\n${stdout.trim().slice(-500) || "(none)"}`
+          ));
+        } else if (error.signal) {
+          reject(new Error(
+            `[GEMINI CRASHED] Process terminated by signal ${error.signal}. ` +
+            `stderr: ${stderr.trim().slice(-500) || "(none)"}`
+          ));
+        } else {
+          reject(new Error(
+            `[GEMINI ERROR] Exit code ${error.code}. ` +
+            `${stderr.trim().slice(-500) || error.message}`
+          ));
+        }
       } else {
         resolve(stdout.trim());
       }
+    });
+
+    proc.on("error", (err) => {
+      reject(new Error(
+        `[GEMINI SPAWN FAILED] Could not start gemini: ${err.message}`
+      ));
     });
   });
 }

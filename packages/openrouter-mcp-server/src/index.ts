@@ -111,24 +111,49 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }))
     );
 
-    const completion = await openai.chat.completions.create({
-      model: params.model,
-      messages,
-      temperature: params.temperature ?? 0.7,
-      max_tokens: params.max_tokens ?? 4096,
-    });
+    try {
+      const completion = await openai.chat.completions.create({
+        model: params.model,
+        messages,
+        temperature: params.temperature ?? 0.7,
+        max_tokens: params.max_tokens ?? 4096,
+      });
 
-    const text = completion.choices[0]?.message?.content ?? "(no response)";
-    const usage = completion.usage;
+      const text = completion.choices[0]?.message?.content ?? "(no response)";
+      const usage = completion.usage;
 
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `${text}\n\n---\nModel: ${completion.model}\nTokens: ${usage?.prompt_tokens ?? "?"} in / ${usage?.completion_tokens ?? "?"} out`,
-        },
-      ],
-    };
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `${text}\n\n---\nModel: ${completion.model}\nTokens: ${usage?.prompt_tokens ?? "?"} in / ${usage?.completion_tokens ?? "?"} out`,
+          },
+        ],
+      };
+    } catch (err: unknown) {
+      const e = err as { status?: number; message?: string; code?: string };
+      if (e.status === 401) {
+        return {
+          content: [{ type: "text" as const, text: `[OPENROUTER AUTH ERROR] Invalid or expired API key. Check OPENROUTER_API_KEY.` }],
+          isError: true,
+        };
+      } else if (e.status === 429) {
+        return {
+          content: [{ type: "text" as const, text: `[OPENROUTER RATE LIMITED] Too many requests. Wait and retry.` }],
+          isError: true,
+        };
+      } else if (e.status === 408 || e.code === "ETIMEDOUT") {
+        return {
+          content: [{ type: "text" as const, text: `[OPENROUTER TIMEOUT] Request timed out. The model may be overloaded. Try a different model.` }],
+          isError: true,
+        };
+      } else {
+        return {
+          content: [{ type: "text" as const, text: `[OPENROUTER ERROR] ${e.status ?? "unknown"}: ${e.message ?? String(err)}` }],
+          isError: true,
+        };
+      }
+    }
   }
 
   if (name === "openrouter_models") {
