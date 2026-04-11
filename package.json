@@ -1,0 +1,13 @@
+{
+  "name": "model-connectors",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Bidirectional MCP servers connecting Claude Code, OpenRouter, Codex, and Gemini CLI",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "clean": "npm run clean --workspaces"
+  }
+}

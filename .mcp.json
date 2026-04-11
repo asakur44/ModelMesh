@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "openrouter": {
+      "command": "node",
+      "args": ["packages/openrouter-mcp-server/dist/index.js"],
+      "env": {
+        "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}"
+      }
+    },
+    "codex": {
+      "command": "node",
+      "args": ["packages/codex-mcp-server/dist/index.js"],
+      "env": {
+        "CONNECTOR_MODE": "${CONNECTOR_MODE:-readonly}"
+      }
+    },
+    "gemini": {
+      "command": "node",
+      "args": ["packages/gemini-mcp-server/dist/index.js"],
+      "env": {
+        "CONNECTOR_MODE": "${CONNECTOR_MODE:-readonly}"
+      }
+    }
+  }
+}
