@@ -15,7 +15,7 @@ const CodexParamsSchema = z.object({
   prompt: z.string().describe("The prompt to send to Codex"),
 });
 
-const TIMEOUT_MS = 120_000;
+const TIMEOUT_MS = 600_000; // 10 minutes — agent tasks can take a while
 
 function shellEscape(str: string): string {
   return '"' + str.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';

@@ -16,7 +16,7 @@ const GeminiParamsSchema = z.object({
   model: z.string().optional().describe("Gemini model to use (e.g. 'pro', 'flash')"),
 });
 
-const TIMEOUT_MS = 120_000;
+const TIMEOUT_MS = 600_000; // 10 minutes — agent tasks can take a while
 
 function shellEscape(str: string): string {
   return '"' + str.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
