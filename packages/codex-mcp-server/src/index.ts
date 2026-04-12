@@ -7,6 +7,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { exec } from "child_process";
 import { z } from "zod";
+import { createInterface } from "readline";
 
 const CONNECTOR_MODE = (process.env.CONNECTOR_MODE ?? "readonly").toLowerCase();
 const IS_AGENT_MODE = CONNECTOR_MODE === "agent";
@@ -19,7 +20,6 @@ const TIMEOUT_MS = 600_000; // 10 minutes — agent tasks can take a while
 
 function shellEscape(str: string): string {
   if (process.platform === "win32") {
-    // Windows cmd.exe: use double quotes, escape internal double quotes
     return '"' + str.replace(/"/g, '\\"') + '"';
   }
   return "'" + str.replace(/'/g, "'\\''") + "'";
@@ -27,7 +27,7 @@ function shellEscape(str: string): string {
 
 function runCodex(prompt: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    let cmd = `codex exec`;
+    let cmd = `codex exec --json`;
     if (IS_AGENT_MODE) {
       cmd += ` --sandbox workspace-write`;
     } else {
@@ -39,34 +39,57 @@ function runCodex(prompt: string): Promise<string> {
       timeout: TIMEOUT_MS,
       killSignal: "SIGTERM",
       windowsHide: true,
-    }, (error, stdout, stderr) => {
-      if (error) {
-        if (error.killed) {
-          reject(new Error(
-            `[CODEX TIMEOUT] Process killed after ${TIMEOUT_MS / 1000}s. ` +
-            `The task was too long for the current timeout. ` +
-            `Partial output:\n${stdout.trim().slice(-500) || "(none)"}`
-          ));
-        } else if (error.signal) {
-          reject(new Error(
-            `[CODEX CRASHED] Process terminated by signal ${error.signal}. ` +
-            `stderr: ${stderr.trim().slice(-500) || "(none)"}`
-          ));
-        } else {
-          reject(new Error(
-            `[CODEX ERROR] Exit code ${error.code}. ` +
-            `${stderr.trim().slice(-500) || error.message}`
-          ));
+    });
+
+    // Close stdin so codex doesn't wait for additional input
+    proc.stdin?.end();
+
+    let stderr = "";
+    const messages: string[] = [];
+    let settled = false;
+
+    proc.stderr?.on("data", (data: Buffer) => { stderr += data.toString(); });
+
+    // Parse JSONL stream — collect agent messages and resolve on turn.completed
+    const rl = createInterface({ input: proc.stdout! });
+    rl.on("line", (line) => {
+      try {
+        const event = JSON.parse(line);
+        if (event.type === "item.completed" && event.item?.text) {
+          messages.push(event.item.text);
         }
-      } else {
-        resolve(stdout.trim());
+        if (event.type === "turn.completed") {
+          settled = true;
+          rl.close();
+          proc.kill();
+          resolve(messages.join("\n") || "(no output)");
+        }
+      } catch {
+        // ignore non-JSON lines
       }
     });
 
-    // Close stdin so codex doesn't try to read from it
-    proc.stdin?.end();
+    proc.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      if (signal || (proc.killed && code !== 0)) {
+        reject(new Error(
+          `[CODEX TIMEOUT] Process killed after ${TIMEOUT_MS / 1000}s. ` +
+          `Partial output:\n${messages.join("\n").slice(-500) || "(none)"}`
+        ));
+      } else if (code !== 0) {
+        reject(new Error(
+          `[CODEX ERROR] Exit code ${code}. ` +
+          `${stderr.trim().slice(-500) || "(no stderr)"}`
+        ));
+      } else {
+        resolve(messages.join("\n") || "(no output)");
+      }
+    });
 
     proc.on("error", (err) => {
+      if (settled) return;
+      settled = true;
       reject(new Error(
         `[CODEX SPAWN FAILED] Could not start codex: ${err.message}`
       ));
