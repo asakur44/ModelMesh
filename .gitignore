@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+wheels/
+*.whl
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Tooling
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.uv-cache/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local user state — never commit session files; they may contain prompts/responses
+.modelmesh/
+api-sessions/
+
+# Secrets — never commit real keys
+secrets.json
+*.key
+*.pem
