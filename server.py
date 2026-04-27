@@ -471,7 +471,7 @@ async def ask_codex(
 @mcp.tool()
 async def ask_gemini(
     prompt: str,
-    model: Optional[str] = None,
+    model: str = "gemini-3.1-pro-preview",
     cwd: Optional[str] = None,
     approval_mode: str = "yolo",
     timeout_sec: int = 600,
@@ -486,7 +486,17 @@ async def ask_gemini(
 
     Args:
         prompt: Task description for Gemini.
-        model: Override default Gemini model (e.g. "gemini-2.5-pro").
+        model: Gemini model id. Default: "gemini-3.1-pro-preview"
+            (Gemini 3.1 Pro — preview status, not stable; latest
+            advanced reasoning + agentic-coding tier). Override per
+            call when needed:
+              - "gemini-2.5-pro" — stable, no preview-rotation risk
+              - "gemini-3-flash-preview" — cheaper, frontier-class
+              - "gemini-3.1-flash-lite-preview" — efficiency variant
+              - "gemini-3.1-flash-live-preview" — real-time / voice
+            Preview ids are rotated by Google on quarterly cadence
+            (-preview → -001 → deprecated); revisit if pinning here
+            starts trailing the published preview id.
         cwd: Working directory. Defaults to the MCP server's CWD.
         approval_mode: One of "default", "auto_edit", "yolo", "plan".
             Must be non-"default" — subprocess cannot answer interactive
