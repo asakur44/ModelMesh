@@ -261,8 +261,12 @@ API_SESSIONS_DIR = (
 # (max_tokens) sits on top of this, so leave headroom.
 _MODEL_CONTEXT_HINT = {
     # DeepSeek direct
-    "deepseek-chat": 128_000,
-    "deepseek-reasoner": 64_000,
+    "deepseek-v4-flash": 1_000_000,
+    "deepseek-v4-pro": 1_000_000,
+    # Legacy aliases — DeepSeek deprecates 2026-07-24; both now route to
+    # V4-Flash (non-thinking and thinking-mode respectively) with 1M ctx.
+    "deepseek-chat": 1_000_000,
+    "deepseek-reasoner": 1_000_000,
     # OpenRouter ids
     "deepseek/deepseek-v4-pro": 1_000_000,
     "deepseek/deepseek-v4-flash": 1_000_000,
@@ -612,7 +616,7 @@ async def ask_openrouter(
 @mcp.tool()
 async def ask_deepseek(
     prompt: str,
-    model: str = "deepseek-chat",
+    model: str = "deepseek-v4-flash",
     system: Optional[str] = None,
     max_tokens: int = 4096,
     session_id: Optional[str] = None,
@@ -626,16 +630,23 @@ async def ask_deepseek(
 
     Args:
         prompt: User message.
-        model: "deepseek-chat" (V3) or "deepseek-reasoner" (R1). On resume
-            the model is locked to whatever was used originally.
+        model: "deepseek-v4-flash" (default; V4 fast tier;
+            $0.14/$0.28 per M tokens cache-miss; 1M context) or
+            "deepseek-v4-pro" (V4 advanced reasoning; $0.435/$0.87 per
+            M tokens with 75% discount valid until 2026-05-05; 1M
+            context). Legacy aliases still accepted, deprecated
+            2026-07-24: "deepseek-chat" routes to V4-Flash non-thinking;
+            "deepseek-reasoner" routes to V4-Flash thinking-mode. On
+            resume the model is locked to whatever was used originally.
         system: Optional system prompt. Used only on a fresh session.
         max_tokens: Cap on response tokens for this turn.
         session_id: Pass None to start a new session (returns a UUID), or
             a UUID from a previous call to continue that conversation.
             History is replayed each call; oldest turns are trimmed when
-            context approaches the model's window (128K chat / 64K reasoner).
-            For deepseek-reasoner: the chain-of-thought (reasoning_content)
-            is intentionally NOT stored — only the final assistant message,
+            context approaches the model's window (1M for V4 family).
+            For deepseek-reasoner (legacy alias) and deepseek-v4-pro
+            thinking mode: the chain-of-thought (reasoning_content) is
+            intentionally NOT stored — only the final assistant message,
             per DeepSeek's guidance.
 
     Returns:
