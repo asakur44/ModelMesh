@@ -270,6 +270,10 @@ _MODEL_CONTEXT_HINT = {
     # OpenRouter ids
     "deepseek/deepseek-v4-pro": 1_000_000,
     "deepseek/deepseek-v4-flash": 1_000_000,
+    # Moonshot AI / Kimi via OpenRouter (added 2026-04-28)
+    "moonshotai/kimi-k2.6": 256_000,
+    "moonshotai/kimi-k2.5": 262_000,
+    "moonshotai/kimi-latest": 262_000,
     # xAI Grok direct
     "grok-4-1-fast": 2_000_000,
     "grok-4-1-fast-latest": 2_000_000,
@@ -567,7 +571,7 @@ async def ask_gemini(
 @mcp.tool()
 async def ask_openrouter(
     prompt: str,
-    model: str = "deepseek/deepseek-v4-pro",
+    model: str = "moonshotai/kimi-k2.6",
     system: Optional[str] = None,
     max_tokens: int = 4096,
     session_id: Optional[str] = None,
@@ -581,15 +585,25 @@ async def ask_openrouter(
 
     Args:
         prompt: User message.
-        model: OpenRouter model id. Default: "deepseek/deepseek-v4-pro"
-            (1M context, strong general/reasoning, cheap). Override
-            only when you need a specific other model.
+        model: OpenRouter model id. Default: "moonshotai/kimi-k2.6"
+            (Moonshot AI Kimi 2.6, released 2026-04-20; 256K context;
+            $0.7448/$4.655 per M tokens in/out; thinking-mode).
             Common alternatives:
+              - "deepseek/deepseek-v4-pro" — 1M context, ~5× cheaper
+                on output ($0.435/$0.87 with 75%-off through
+                2026-05-05; ~$1.74/$3.48 full price after); right
+                pick for cost-sensitive or long-context work
+              - "moonshotai/kimi-latest" — auto-rolls to newest Kimi
+                (currently K2.6); use when you want to track latest
+                without manual id updates
+              - "moonshotai/kimi-k2.5" — Jan 2026 Kimi; 262K ctx;
+                $0.44/$2.00 per M tokens (cheaper Kimi alternative)
               - "anthropic/claude-sonnet-4.6" — strong code + writing
               - "anthropic/claude-opus-4.7" — deepest reasoning
               - "openai/gpt-5" — OpenAI perspective
               - "google/gemini-2.5-pro" — long-context Google
-              - "x-ai/grok-4" — break out of consensus answers
+              - "x-ai/grok-4" — xAI via OR (use direct ask_grok if
+                XAI_API_KEY is set; cheaper)
             On resume the model is locked to whatever was used
             originally and this argument is ignored.
         system: Optional system prompt. Used only on a fresh session;
