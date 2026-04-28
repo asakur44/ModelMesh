@@ -573,7 +573,7 @@ async def ask_openrouter(
     prompt: str,
     model: str = "moonshotai/kimi-k2.6",
     system: Optional[str] = None,
-    max_tokens: int = 16384,
+    max_tokens: int = 100000,
     session_id: Optional[str] = None,
 ) -> dict:
     """Chat completion via OpenRouter, with multi-turn sessions.
@@ -642,7 +642,7 @@ async def ask_deepseek(
     prompt: str,
     model: str = "deepseek-v4-pro",
     system: Optional[str] = None,
-    max_tokens: int = 16384,
+    max_tokens: int = 100000,
     session_id: Optional[str] = None,
 ) -> dict:
     """Chat completion via the DeepSeek API, with multi-turn sessions.
@@ -669,14 +669,18 @@ async def ask_deepseek(
             On resume the model is locked to whatever was used originally
             and this argument is ignored.
         system: Optional system prompt. Used only on a fresh session.
-        max_tokens: Cap on response tokens for this turn. Default 16384
-            (bumped 2026-04-28 from 4096 because all thinking-mode
+        max_tokens: Cap on response tokens for this turn. Default
+            100000 (bumped 2026-04-29 from 16384, which itself replaced
+            the original 4096 on 2026-04-28). All current thinking-mode
             defaults — V4-Pro, Kimi K2.6, Grok 4.20-reasoning — consume
             tokens on internal reasoning before producing visible
-            output, and 4096 was silently truncating real work). The
-            cap is just a ceiling; you only pay for what's generated.
-            Bump to 32768+ for long synthesis tasks; drop to ~512 for
-            terse smoke-tests.
+            output, and any cap below ~16K silently truncated real
+            work. 100k is effectively "no cap" for any single response
+            modern models will actually generate (most cap their own
+            output at 8K–32K regardless of what's requested), and
+            providers either accept and clamp or pass through cleanly.
+            The cap is just a ceiling; you only pay for what's
+            generated. Drop to ~512 for terse smoke-tests.
         session_id: Pass None to start a new session (returns a UUID), or
             a UUID from a previous call to continue that conversation.
             History is replayed each call; oldest turns are trimmed when
@@ -708,7 +712,7 @@ async def ask_grok(
     prompt: str,
     model: str = "grok-4.20-reasoning",
     system: Optional[str] = None,
-    max_tokens: int = 16384,
+    max_tokens: int = 100000,
     session_id: Optional[str] = None,
 ) -> dict:
     """Chat completion via the xAI Grok API, with multi-turn sessions.
