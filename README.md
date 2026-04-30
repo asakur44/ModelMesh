@@ -2,7 +2,7 @@
 
 An MCP server that lets Claude Code (or any MCP client) delegate work to other LLMs as subagents — preserving conversation continuity across turns via stable session IDs.
 
-Wraps five backends:
+Wraps six backends:
 
 | Tool | Backend | Auth |
 |---|---|---|
@@ -11,6 +11,7 @@ Wraps five backends:
 | `ask_openrouter` | OpenRouter HTTPS API (any model) | `OPENROUTER_API_KEY` env |
 | `ask_deepseek` | DeepSeek HTTPS API | `DEEPSEEK_API_KEY` env |
 | `ask_grok` | xAI Grok HTTPS API | `XAI_API_KEY` env |
+| `ask_zai` | Z.AI (Zhipu) HTTPS API — JWT auth handled internally | `ZAI_API_KEY` env (legacy `id.secret` shape) |
 
 Plus admin tools: `list_api_sessions`, `delete_api_session`.
 
@@ -18,9 +19,9 @@ Plus admin tools: `list_api_sessions`, `delete_api_session`.
 
 ## Why this exists
 
-Claude Code is great, but sometimes you want a second opinion from GPT-5, or to delegate a long task to Gemini's 1M-context model, or to run a cheap reasoning pass on DeepSeek-R1. Doing this by hand — switching tools, copy-pasting context, losing thread — is friction.
+Claude Code is great, but sometimes you want a second opinion from GPT-5.5, or to delegate a long task to Gemini's 1M-context model, or to run cheap reasoning on DeepSeek-V4-Flash, or to triangulate against Z.AI's GLM-5.1. Doing this by hand — switching tools, copy-pasting context, losing thread — is friction.
 
-ModelMesh turns those LLMs into first-class tools Claude can call mid-conversation. Each call returns a `session_id` you can pass back on the next call to keep the conversation going. Codex/Gemini sessions persist in their own native stores; DeepSeek/OpenRouter conversations are kept in a local JSON store and replayed on each call.
+ModelMesh turns those LLMs into first-class tools Claude can call mid-conversation. Each call returns a `session_id` you can pass back on the next call to keep the conversation going. Codex/Gemini sessions persist in their own native stores; DeepSeek/OpenRouter/Grok/Z.AI conversations are kept in a local JSON store and replayed on each call.
 
 ---
 
@@ -28,12 +29,13 @@ ModelMesh turns those LLMs into first-class tools Claude can call mid-conversati
 
 ### Prerequisites
 
-- Python 3.10+
+- Python 3.10+ (PyJWT is now a dependency — `pip install` handles it; `uv run` reads it from PEP 723 metadata)
 - For `ask_codex`: install and authenticate [Codex CLI](https://developers.openai.com/codex/cli) (`npm install -g @openai/codex` then `codex login`)
 - For `ask_gemini`: install and authenticate [Gemini CLI](https://geminicli.com) (`npm install -g @google/gemini-cli` then `gemini auth`)
 - For `ask_openrouter`: an [OpenRouter API key](https://openrouter.ai/settings/keys)
 - For `ask_deepseek`: a [DeepSeek API key](https://platform.deepseek.com/api_keys)
 - For `ask_grok`: an [xAI API key](https://console.x.ai/)
+- For `ask_zai`: a [Z.AI API key](https://platform.kimi.ai/) (legacy `id.secret` format — the tool generates the required JWT internally; do NOT pre-sign)
 
 ### Install the server
 
@@ -45,7 +47,7 @@ pip install .
 
 This puts a `modelmesh` console command on your PATH.
 
-(Alternative: if you have [`uv`](https://docs.astral.sh/uv/) installed, you can skip `pip install` and use `uv run server.py` — the inline PEP 723 metadata handles deps.)
+(Alternative: if you have [`uv`](https://docs.astral.sh/uv/) installed, you can skip `pip install` and use `uv run server.py` — the inline PEP 723 metadata handles deps including `pyjwt>=2.0.0` for `ask_zai`.)
 
 ### Register with Claude Code
 
@@ -54,12 +56,13 @@ claude mcp add --scope user modelmesh \
   --env OPENROUTER_API_KEY=sk-or-... \
   --env DEEPSEEK_API_KEY=sk-... \
   --env XAI_API_KEY=xai-... \
+  --env ZAI_API_KEY=<key_id>.<secret> \
   -- modelmesh
 ```
 
 `--scope user` makes it available across all your projects. Drop `--env` flags for any provider you don't have a key for; the corresponding tools will return a clean error when called instead of crashing the server.
 
-In Claude Code, run `/mcp` to confirm `modelmesh` is connected. Seven tools should now be callable.
+In Claude Code, run `/mcp` to confirm `modelmesh` is connected. Eight tools should now be callable (six chat subagents + two admin tools).
 
 ### Register with other MCP clients
 
@@ -100,25 +103,50 @@ ask_codex(prompt="now write tests for it", session_id=sid)
 
 ### Choosing a model
 
-`ask_openrouter` defaults to `deepseek/deepseek-v4-pro` (1M context, cheap, strong general/reasoning). Override per-call:
+All six chat subagents have explicit string defaults — no "depends on local CLI" footnotes. Override per call when you want something else.
+
+`ask_openrouter` defaults to `moonshotai/kimi-k2.6` (Moonshot AI Kimi 2.6, 256K context, thinking-mode). Override:
 
 ```python
+ask_openrouter(prompt="...", model="deepseek/deepseek-v4-pro")    # 1M ctx, ~5× cheaper on output
 ask_openrouter(prompt="...", model="anthropic/claude-sonnet-4.6")
-ask_openrouter(prompt="...", model="openai/gpt-5")
-ask_openrouter(prompt="...", model="x-ai/grok-4")
+ask_openrouter(prompt="...", model="openai/gpt-5.5")
+ask_openrouter(prompt="...", model="x-ai/grok-4.20-reasoning")
 ```
 
-`ask_deepseek` defaults to `deepseek-chat` (V3). For hard reasoning use `deepseek-reasoner` (R1):
+`ask_deepseek` defaults to `deepseek-v4-pro` (V4 advanced reasoning, thinking-mode). Drop to V4-Flash for high-volume / cost-sensitive work:
 
 ```python
-ask_deepseek(prompt="prove that...", model="deepseek-reasoner")
+ask_deepseek(prompt="...", model="deepseek-v4-flash")
 ```
 
-`ask_grok` defaults to `grok-4-1-fast` (alias for the current frontier reasoning variant; 2M context). Other choices:
+Legacy aliases `deepseek-chat` / `deepseek-reasoner` route to V4-Flash non-thinking / thinking-mode respectively; both deprecated 2026-07-24.
+
+`ask_grok` defaults to `grok-4.20-reasoning` (xAI flagship reasoning). Other choices:
 
 ```python
-ask_grok(prompt="...", model="grok-4-1-fast-non-reasoning")  # fast, no reasoning
-ask_grok(prompt="...", model="grok-code-fast-1")              # agentic coding (256K)
+ask_grok(prompt="...", model="grok-4-1-fast-reasoning")  # 10× cheaper, 2M ctx, high-volume
+ask_grok(prompt="...", model="grok-code-fast-1")          # agentic coding (256K)
+```
+
+`ask_gemini` defaults to `gemini-3.1-pro-preview` (preview tier — Google rotates `-preview` ids on roughly quarterly cadence; revisit when it gets promoted). Override to a stable tier when you don't want preview-rotation risk:
+
+```python
+ask_gemini(prompt="...", model="gemini-2.5-pro")
+```
+
+`ask_zai` defaults to `glm-5.1` (Zhipu AI flagship; thinking-mode with separate `reasoning_content` stream like `deepseek-reasoner`). Other GLM variants:
+
+```python
+ask_zai(prompt="...", model="glm-5-turbo")    # faster, lower latency
+ask_zai(prompt="...", model="glm-4.7")         # prior generation
+```
+
+`ask_codex` defaults to `gpt-5.5` (OpenAI flagship). Override:
+
+```python
+ask_codex(prompt="...", model="gpt-5")
+ask_codex(prompt="...", model="o3")
 ```
 
 ---
@@ -131,7 +159,7 @@ Claude Code won't automatically capture session IDs unless you teach it to. Add 
 ## modelmesh — session_id continuity
 
 The MCP server `modelmesh` exposes `ask_codex`, `ask_gemini`,
-`ask_deepseek`, `ask_openrouter`, `ask_grok`. Each returns
+`ask_deepseek`, `ask_openrouter`, `ask_grok`, `ask_zai`. Each returns
 `{"output": str, "session_id": str | None}`.
 
 **Rule:** Treat the returned `session_id` as load-bearing.
@@ -156,6 +184,7 @@ All optional. Set in the `--env` flags when registering, or in your shell enviro
 | `DEEPSEEK_API_KEY` | DeepSeek API key | required for `ask_deepseek` |
 | `OPENROUTER_API_KEY` | OpenRouter API key | required for `ask_openrouter` |
 | `XAI_API_KEY` | xAI Grok API key | required for `ask_grok` |
+| `ZAI_API_KEY` | Z.AI (Zhipu) API key in legacy `id.secret` format — tool generates JWT internally | required for `ask_zai` |
 | `MODELMESH_DIR` | Where to store API session files | `~/.modelmesh/` |
 | `OPENROUTER_REFERER` | `HTTP-Referer` header sent to OpenRouter (analytics attribution) | omitted |
 | `OPENROUTER_TITLE` | `X-Title` header sent to OpenRouter | omitted |
@@ -168,6 +197,7 @@ All optional. Set in the `--env` flags when registering, or in your shell enviro
 
 Runs the Codex CLI's full agent loop (read files, edit, run shell commands) inside a sandbox.
 
+- `model`: default `"gpt-5.5"`. Override to `"gpt-5"`, `"o3"`, or any model id your Codex CLI auth has access to.
 - `sandbox`: `"read-only"` | `"workspace-write"` (default) | `"danger-full-access"`
 - `cwd`: working directory for Codex (default: server's CWD)
 - `session_id`: pass `None` for fresh, `"last"` for most recent, or any UUID/thread name to resume that exact session
@@ -176,6 +206,7 @@ Runs the Codex CLI's full agent loop (read files, edit, run shell commands) insi
 
 Runs the Gemini CLI as an agent.
 
+- `model`: default `"gemini-3.1-pro-preview"`. Preview tier — Google rotates `-preview` ids quarterly; revisit when it promotes. Override to `"gemini-2.5-pro"` for stable.
 - `approval_mode`: `"yolo"` (default) | `"auto_edit"` | `"plan"` (read-only) — must NOT be `"default"` (would block on prompts)
 - `session_id`: pass `None` for fresh, `"last"` for most recent, or a hex id previously returned by this tool
 
@@ -185,7 +216,8 @@ Note: Gemini's CLI resumes by mtime-ordered index, not by stable id. The server 
 
 Stateless API calls + local session replay.
 
-- `model`: default `"deepseek/deepseek-v4-pro"`. Pass any [OpenRouter model id](https://openrouter.ai/models).
+- `model`: default `"moonshotai/kimi-k2.6"` (Moonshot AI Kimi 2.6; 256K context; thinking-mode). Pass any [OpenRouter model id](https://openrouter.ai/models) to override.
+- `max_tokens`: default `100000` — effectively no-cap; OpenRouter clamps to per-model `max_completion_tokens` server-side. The cap is a ceiling, not a charge.
 - `system`: optional system prompt (used only on fresh sessions)
 - `session_id`: pass `None` for fresh, or a UUID from a previous call
 
@@ -193,17 +225,27 @@ History is replayed each call; oldest pairs are trimmed when context approaches 
 
 ### `ask_deepseek(prompt, model?, system?, max_tokens?, session_id?)`
 
-- `model`: `"deepseek-chat"` (V3, default) or `"deepseek-reasoner"` (R1)
-- For `deepseek-reasoner`: `reasoning_content` (CoT) is intentionally NOT stored, per DeepSeek's guidance — only the final assistant message goes into history.
+- `model`: default `"deepseek-v4-pro"` (V4 advanced reasoning, thinking-mode; $0.435/$0.87 per M tokens with 75% discount through 2026-05-05, then ~$1.74/$3.48). Drop to `"deepseek-v4-flash"` ($0.14/$0.28 per M, ~3× cheaper) for high-volume work. Legacy `"deepseek-chat"` / `"deepseek-reasoner"` route to V4-Flash non-thinking / thinking-mode; deprecated 2026-07-24.
+- `max_tokens`: default `100000`. V4-Pro is thinking-mode and consumes tokens on internal reasoning before producing visible output; budget generously.
+- For thinking-mode (V4-Pro and `deepseek-reasoner`): `reasoning_content` (CoT) is intentionally NOT stored, per DeepSeek's guidance — only the final assistant message goes into history.
 
 ### `ask_grok(prompt, model?, system?, max_tokens?, session_id?)`
 
-- `model`: `"grok-4-1-fast"` (default; alias for `grok-4-1-fast-reasoning`, 2M context). Other ids: `"grok-4-1-fast-non-reasoning"`, `"grok-code-fast-1"` (256K coding), `"grok-4"` / `"grok-4-0709"` (older 256K).
+- `model`: default `"grok-4.20-reasoning"` (xAI flagship reasoning; $2/$6 per M tokens). Drop to `"grok-4-1-fast-reasoning"` ($0.20/$0.50 per M, 2M ctx) for high-volume work. Other ids: `"grok-code-fast-1"` (256K coding-tuned), `"grok-4"` / `"grok-4-0709"` (older 256K).
+- `max_tokens`: default `100000`.
 - `session_id`: same shape as the other API tools — None for fresh, a UUID from a previous call to resume.
+
+### `ask_zai(prompt, model?, system?, max_tokens?, session_id?)`
+
+Z.AI (Zhipu AI) GLM API. Default model `glm-5.1` (flagship; thinking-mode with separate `reasoning_content` stream like `deepseek-reasoner`).
+
+- `model`: default `"glm-5.1"`. Other ids: `"glm-5"`, `"glm-5-turbo"` (faster), `"glm-5v-turbo"` (multimodal vision), `"glm-4.7"` / `"glm-4.7-flash"`, `"glm-4.6"`, `"glm-4.5"`.
+- `max_tokens`: default `100000`. GLM-5.1 is thinking-mode; budget generously (the model consumes ~70+ reasoning tokens even on trivial prompts).
+- **Auth note**: `ZAI_API_KEY` must be the legacy Zhipu `id.secret` format (32-char hex + `.` + alphanum secret). The tool generates an HS256-signed JWT per call internally before sending; raw-Bearer auth with the unsigned key fails on `paas/v4` with `"token expired or incorrect"` despite some docs implying it works. The official `z-ai-sdk-python` does this signing transparently; we do it explicitly.
 
 ### `list_api_sessions(provider?)`
 
-List stored DeepSeek / OpenRouter / Grok sessions, newest first. Filter by `"deepseek"`, `"openrouter"`, or `"grok"`.
+List stored DeepSeek / OpenRouter / Grok / Z.AI sessions, newest first. Filter by `"deepseek"`, `"openrouter"`, `"grok"`, or `"zai"`.
 
 ### `delete_api_session(session_id)`
 
@@ -220,8 +262,9 @@ Drop a stored session.
 | DeepSeek | `$MODELMESH_DIR/api-sessions/<uuid>.json` | UUID we generate. Atomic JSON writes. |
 | OpenRouter | Same as DeepSeek | Same. |
 | Grok | Same as DeepSeek | Same. |
+| Z.AI | Same as DeepSeek | Same. JWT is regenerated per call (1-hour exp); session_id only tracks message history. |
 
-For DeepSeek/OpenRouter/Grok, full message history is replayed on every call (the API itself is stateless). When estimated tokens approach the model's context window, oldest user/assistant pairs are dropped (system messages preserved).
+For DeepSeek/OpenRouter/Grok/Z.AI, full message history is replayed on every call (the API itself is stateless). When estimated tokens approach the model's context window, oldest user/assistant pairs are dropped (system messages preserved).
 
 ---
 
@@ -229,8 +272,10 @@ For DeepSeek/OpenRouter/Grok, full message history is replayed on every call (th
 
 - **No streaming.** Tools return final text only. Codex/Gemini agent loops can take minutes; you won't see partial output.
 - **No image input** for `ask_codex` / `ask_gemini` (CLIs support `-i`; not exposed yet).
-- **DeepSeek/OpenRouter/Grok token cost grows linearly per turn** — full history is resent each call. DeepSeek's context caching offsets repeat-prefix cost; OpenRouter pass-through depends on the underlying provider; xAI's caching policy varies by model.
+- **DeepSeek/OpenRouter/Grok/Z.AI token cost grows linearly per turn** — full history is resent each call. DeepSeek's context caching offsets repeat-prefix cost; OpenRouter pass-through depends on the underlying provider; xAI's caching policy varies by model; Z.AI doesn't currently surface a caching parameter on `paas/v4`.
+- **Thinking-mode models can hit `max_tokens` invisibly** if you set the cap too low — the model spends 2–6K tokens on internal reasoning before producing visible output, so `max_tokens=4096` will silently truncate real work. The `100000` default avoids this; budget at least 16K if you override.
 - **Gemini IDs are not natively stable.** The CLI resumes by mtime-ordered index; we rebuild stability by scanning the chat dir. If the user clears history, IDs become invalid.
+- **Z.AI key format quirk:** keys are `id.secret` and require client-side JWT signing. The tool handles this internally; do NOT pre-sign or pass a JWT as `ZAI_API_KEY`.
 - **Windows + npm shim quirk:** the server resolves CLI paths via `shutil.which()` and explicitly closes stdin to `DEVNULL` to avoid documented hangs in `codex exec` and `gemini -p` when run as a subprocess.
 
 ---
@@ -248,5 +293,5 @@ PRs welcome. The whole server is one file (`server.py`) plus `pyproject.toml` �
 Areas where help would be useful:
 - Streaming output (would require an MCP shape change)
 - Image input for Codex/Gemini
-- More providers (Anthropic direct, local Ollama, etc.)
+- More providers (Anthropic direct, local Ollama, Mistral, etc.)
 - Tests
