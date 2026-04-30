@@ -3,19 +3,21 @@
 # dependencies = [
 #   "mcp>=1.2.0",
 #   "httpx>=0.27.0",
+#   "pyjwt>=2.0.0",
 # ]
 # ///
 """ModelMesh MCP server.
 
-Exposes five subagent tools to any MCP client (Claude Code, Cursor, etc.):
+Exposes six subagent tools to any MCP client (Claude Code, Cursor, etc.):
   - ask_codex     -> wraps the local `codex` CLI (agentic loop)
   - ask_gemini    -> wraps the local `gemini` CLI (agentic loop)
   - ask_openrouter-> chat completion via OpenRouter (multi-turn supported)
   - ask_deepseek  -> chat completion via DeepSeek API (multi-turn supported)
   - ask_grok      -> chat completion via xAI Grok API (multi-turn supported)
+  - ask_zai       -> chat completion via z.ai (Zhipu) GLM API (multi-turn supported)
 
 Plus admin tools:
-  - list_api_sessions  -> enumerate stored DeepSeek/OpenRouter/Grok sessions
+  - list_api_sessions  -> enumerate stored DeepSeek/OpenRouter/Grok/z.ai sessions
   - delete_api_session -> drop a stored session
 
 Codex/Gemini inherit auth from their own CLIs (`codex login`, `gemini auth`).
@@ -23,11 +25,13 @@ API tools read keys from env:
   - OPENROUTER_API_KEY for ask_openrouter
   - DEEPSEEK_API_KEY   for ask_deepseek
   - XAI_API_KEY        for ask_grok
+  - ZAI_API_KEY        for ask_zai (legacy "id.secret" format; tool generates
+                                    JWT per call, do NOT pre-sign)
 
-All five chat tools return: {"output": str, "session_id": str | None}.
+All six chat tools return: {"output": str, "session_id": str | None}.
 
 Codex / Gemini sessions live where the CLI puts them (codex sqlite,
-gemini chat files). DeepSeek / OpenRouter / Grok sessions live in
+gemini chat files). DeepSeek / OpenRouter / Grok / z.ai sessions live in
 $MODELMESH_DIR/api-sessions/<uuid>.json (default
 ~/.modelmesh/api-sessions/) — full message history, replayed on
 each call.
@@ -52,6 +56,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+import jwt
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("modelmesh")
@@ -289,6 +294,16 @@ _MODEL_CONTEXT_HINT = {
     "grok-4.20-0309-reasoning": 256_000,
     "grok-4.20-0309-non-reasoning": 256_000,
     "grok-4.20-multi-agent-0309": 256_000,
+    # Zhipu z.ai GLM family (added 2026-04-29); conservative 128K hints
+    # pending z.ai docs confirmation per model.
+    "glm-5.1": 128_000,
+    "glm-5": 128_000,
+    "glm-5-turbo": 128_000,
+    "glm-5v-turbo": 128_000,
+    "glm-4.7": 128_000,
+    "glm-4.7-flash": 128_000,
+    "glm-4.6": 128_000,
+    "glm-4.5": 128_000,
 }
 _DEFAULT_CONTEXT_HINT = 100_000  # safe-ish for most OpenRouter models
 
@@ -762,16 +777,119 @@ async def ask_grok(
     )
 
 
+def _zai_jwt_token(api_key: str, exp_seconds: int = 3600) -> str:
+    """Generate a JWT for z.ai's legacy "id.secret"-format API key.
+
+    z.ai (Zhipu AI) keys come as "<key_id>.<secret>" and require client-side
+    JWT signing — the gateway parses the Bearer header as a JWT, not as a
+    raw key, despite some z.ai docs implying plain Bearer auth works on the
+    paas/v4 endpoint. Raw-key Bearer fails with `{"code":"401","message":
+    "token expired or incorrect"}` on first call. The official z-ai-sdk
+    does this signing transparently; we do it explicitly here so the
+    OpenAI-compatible chat-completions path still works.
+
+    Algorithm: HS256 with the secret half of the key as the HMAC key.
+    Headers: {"alg": "HS256", "sign_type": "SIGN"} — the sign_type header
+    is required by z.ai's gateway and absent from the spec; copy from SDK.
+    Claims: {"api_key": <key_id>, "exp": now_ms + exp_seconds*1000,
+             "timestamp": now_ms} — note millisecond units, not seconds.
+    """
+    if "." not in api_key:
+        raise RuntimeError(
+            "ZAI_API_KEY must be in 'id.secret' format (legacy Zhipu shape)."
+        )
+    key_id, secret = api_key.split(".", 1)
+    now_ms = int(round(time.time() * 1000))
+    payload = {
+        "api_key": key_id,
+        "exp": now_ms + exp_seconds * 1000,
+        "timestamp": now_ms,
+    }
+    return jwt.encode(
+        payload,
+        secret,
+        algorithm="HS256",
+        headers={"alg": "HS256", "sign_type": "SIGN"},
+    )
+
+
+@mcp.tool()
+async def ask_zai(
+    prompt: str,
+    model: str = "glm-5.1",
+    system: Optional[str] = None,
+    max_tokens: int = 100000,
+    session_id: Optional[str] = None,
+) -> dict:
+    """Chat completion via the z.ai (Zhipu AI) GLM API, with multi-turn sessions.
+
+    Continuity: this tool returns a session_id. To continue the same
+    conversation on a follow-up call, you MUST pass that session_id
+    back. Omitting it starts a fresh chat that has no memory of prior
+    turns. Only start fresh when the work is unrelated.
+
+    Args:
+        prompt: User message.
+        model: z.ai model id. Default: "glm-5.1" (Zhipu AI flagship for
+            coding + agent tasks; thinking-mode with separate
+            reasoning_content stream — internal reasoning is NOT stored
+            in session history; only the final assistant message is
+            retained, mirroring DeepSeek V4-Pro and the deepseek-reasoner
+            legacy alias).
+            Other choices:
+              - "glm-5" — base GLM-5 without 5.1 refinements
+              - "glm-5-turbo" — faster, lower latency variant
+              - "glm-5v-turbo" — multimodal vision variant
+              - "glm-4.7" / "glm-4.7-flash" — prior generation
+              - "glm-4.6" / "glm-4.5" — older generations
+            On resume the model is locked to whatever was used originally
+            and this argument is ignored.
+        system: Optional system prompt. Used only on a fresh session.
+        max_tokens: Cap on response tokens for this turn. GLM-5.1 is
+            thinking-mode and consumes tokens on internal reasoning
+            before producing visible output (~70 reasoning tokens even
+            for trivial prompts), so budget generously — the 100000
+            default is effectively no-cap for any single response GLM
+            will actually generate.
+        session_id: Pass None to start a new session (returns a UUID), or
+            a UUID from a previous call to continue that conversation.
+            History is replayed each call; oldest turns are trimmed when
+            context approaches the model's window (conservative 128K
+            hint pending z.ai per-model docs).
+
+    Returns:
+        {"output": str, "session_id": str}
+        Stash session_id; pass it back to continue.
+
+    Auth note: ZAI_API_KEY must be the legacy Zhipu "id.secret" format
+    (32-char hex + dot + 17-char alphanum). The tool generates a fresh
+    JWT per call (HS256-signed with the secret half) before sending; raw
+    Bearer auth with the unsigned key fails on the paas/v4 endpoint.
+    """
+    api_key = _require_env("ZAI_API_KEY")
+    jwt_token = _zai_jwt_token(api_key)
+    return await _api_chat_with_session(
+        provider="zai",
+        base_url="https://api.z.ai/api/paas/v4",
+        api_key=jwt_token,
+        model=model,
+        prompt=prompt,
+        system=system,
+        max_tokens=max_tokens,
+        session_id=session_id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Session admin tools
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
 async def list_api_sessions(provider: Optional[str] = None) -> list[dict]:
-    """List stored DeepSeek / OpenRouter / Grok sessions, newest first.
+    """List stored DeepSeek / OpenRouter / Grok / z.ai sessions, newest first.
 
     Args:
-        provider: Filter to "deepseek", "openrouter", or "grok".
+        provider: Filter to "deepseek", "openrouter", "grok", or "zai".
             None returns all.
 
     Returns:
@@ -805,7 +923,7 @@ async def list_api_sessions(provider: Optional[str] = None) -> list[dict]:
 
 @mcp.tool()
 async def delete_api_session(session_id: str) -> dict:
-    """Delete a stored DeepSeek / OpenRouter session.
+    """Delete a stored DeepSeek / OpenRouter / Grok / z.ai session.
 
     Returns:
         {"deleted": bool, "session_id": str, "reason": str | None}
