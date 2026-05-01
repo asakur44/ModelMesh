@@ -45,6 +45,7 @@ Optional env vars:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -54,11 +55,11 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import httpx
 import jwt
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 mcp = FastMCP("modelmesh")
 
@@ -211,7 +212,7 @@ async def _openai_compatible_chat(
     messages: list[dict],
     max_tokens: int,
     extra_headers: Optional[dict] = None,
-    timeout_sec: int = 180,
+    timeout_sec: int = 900,
 ) -> str:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -240,6 +241,84 @@ async def _openai_compatible_chat(
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as e:
         raise RuntimeError(f"unexpected response shape: {data}") from e
+
+
+# ---------------------------------------------------------------------------
+# Progress heartbeat (parent-agent watchdog kept alive during slow calls)
+# ---------------------------------------------------------------------------
+# Thinking-mode reasoning models — DeepSeek V4-Pro, Grok 4.20-reasoning,
+# Kimi K2.6, Gemini 3.1 Pro Preview, GLM-5.1 — routinely take 5–15
+# minutes per call. Parent agents (e.g. Claude Code's stream watchdog)
+# kill any agent that goes ~600s without emitting tool-call output.
+# A long ask_* call spends that whole window awaiting the underlying
+# API; the parent sees silence and gives up even though the call is
+# making real progress.
+#
+# Fix: while the main API/CLI call is awaiting, emit MCP progress
+# notifications every 30s. The parent's watchdog should count these as
+# liveness signal. Notifications are protocol-level (not stdout text),
+# so clients that don't understand them silently ignore.
+#
+# No-op when ctx is None (e.g. test harnesses that import the helpers
+# directly without going through MCP).
+
+HEARTBEAT_INTERVAL_SEC = float(
+    os.environ.get("MODELMESH_HEARTBEAT_INTERVAL_SEC", "30")
+)
+
+
+@contextlib.asynccontextmanager
+async def _heartbeat_context(
+    ctx: Optional[Context],
+    provider: str,
+    model: str,
+    interval_sec: float = HEARTBEAT_INTERVAL_SEC,
+) -> AsyncIterator[None]:
+    """Emit progress notifications every interval_sec while the wrapped
+    block runs. Cancels the heartbeat task on exit (success or error).
+    Heartbeat exceptions are swallowed — the actual call must not crash
+    because the watchdog ping failed.
+    """
+    if ctx is None:
+        yield
+        return
+
+    async def _emit_loop() -> None:
+        # Initial ping at 0 so the watchdog sees us start.
+        try:
+            await ctx.report_progress(
+                progress=0.0,
+                message=f"{provider}/{model}: starting...",
+            )
+        except Exception:
+            pass
+        elapsed = 0.0
+        while True:
+            try:
+                await asyncio.sleep(interval_sec)
+                elapsed += interval_sec
+                await ctx.report_progress(
+                    progress=elapsed,
+                    message=(
+                        f"{provider}/{model}: thinking... "
+                        f"({int(elapsed)}s elapsed)"
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Heartbeat must never crash the actual call.
+                pass
+
+    task = asyncio.create_task(_emit_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 def _require_env(var: str) -> str:
@@ -372,8 +451,16 @@ async def _api_chat_with_session(
     max_tokens: int,
     session_id: Optional[str],
     extra_headers: Optional[dict] = None,
+    ctx: Optional[Context] = None,
 ) -> dict:
-    """Run an OpenAI-compatible chat with optional session persistence."""
+    """Run an OpenAI-compatible chat with optional session persistence.
+
+    If ctx is provided (FastMCP injects automatically when the calling
+    tool declares `ctx: Context`), progress notifications are emitted
+    every HEARTBEAT_INTERVAL_SEC while the slow API call awaits, keeping
+    the parent agent's watchdog alive on thinking-mode runs that can
+    take 5-15 minutes.
+    """
     is_resume = session_id is not None
     if is_resume:
         sess = _load_api_session(session_id)
@@ -395,14 +482,15 @@ async def _api_chat_with_session(
     history_budget = max(ctx_cap - max_tokens, ctx_cap // 2)
     messages = _trim_history(messages, history_budget)
 
-    text = await _openai_compatible_chat(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        messages=messages,
-        max_tokens=max_tokens,
-        extra_headers=extra_headers,
-    )
+    async with _heartbeat_context(ctx, provider, model):
+        text = await _openai_compatible_chat(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            extra_headers=extra_headers,
+        )
     messages.append({"role": "assistant", "content": text})
 
     _save_api_session(
@@ -480,6 +568,7 @@ async def ask_codex(
     sandbox: str = "workspace-write",
     timeout_sec: int = 600,
     session_id: Optional[str] = None,
+    ctx: Optional[Context] = None,
 ) -> dict:
     """Run a prompt through the OpenAI Codex CLI as an agentic subagent.
 
@@ -544,15 +633,16 @@ async def ask_codex(
             args.extend(["-C", cwd])
     args.append(effective_prompt)
 
-    try:
-        stdout, stderr = await _run_subprocess(args, timeout_sec=timeout_sec)
-    finally:
-        # Best-effort cleanup of the brief file regardless of success/error.
-        if brief_path is not None:
-            try:
-                brief_path.unlink()
-            except OSError:
-                pass
+    async with _heartbeat_context(ctx, "codex", model):
+        try:
+            stdout, stderr = await _run_subprocess(args, timeout_sec=timeout_sec)
+        finally:
+            # Best-effort cleanup of the brief file regardless of success/error.
+            if brief_path is not None:
+                try:
+                    brief_path.unlink()
+                except OSError:
+                    pass
 
     resolved_id = _extract_codex_session_id(stdout, stderr)
     # If user passed an explicit UUID and we couldn't extract one, keep theirs.
@@ -570,6 +660,7 @@ async def ask_gemini(
     approval_mode: str = "yolo",
     timeout_sec: int = 600,
     session_id: Optional[str] = None,
+    ctx: Optional[Context] = None,
 ) -> dict:
     """Run a prompt through the Google Gemini CLI as an agentic subagent.
 
@@ -643,7 +734,8 @@ async def ask_gemini(
             args.extend(["-r", str(idx)])
 
     chats_before = {p.name for p in _gemini_chat_files()}
-    stdout, _ = await _run_subprocess(args, timeout_sec=timeout_sec, cwd=cwd)
+    async with _heartbeat_context(ctx, "gemini", model):
+        stdout, _ = await _run_subprocess(args, timeout_sec=timeout_sec, cwd=cwd)
 
     # Resolve the resulting session_id.
     if target_known_id is not None:
@@ -665,6 +757,7 @@ async def ask_openrouter(
     system: Optional[str] = None,
     max_tokens: int = 100000,
     session_id: Optional[str] = None,
+    ctx: Optional[Context] = None,
 ) -> dict:
     """Chat completion via OpenRouter, with multi-turn sessions.
 
@@ -715,6 +808,7 @@ async def ask_openrouter(
     if title := os.environ.get("OPENROUTER_TITLE"):
         headers["X-Title"] = title
     return await _api_chat_with_session(
+        ctx=ctx,
         provider="openrouter",
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key,
@@ -734,6 +828,7 @@ async def ask_deepseek(
     system: Optional[str] = None,
     max_tokens: int = 100000,
     session_id: Optional[str] = None,
+    ctx: Optional[Context] = None,
 ) -> dict:
     """Chat completion via the DeepSeek API, with multi-turn sessions.
 
@@ -786,6 +881,7 @@ async def ask_deepseek(
     """
     api_key = _require_env("DEEPSEEK_API_KEY")
     return await _api_chat_with_session(
+        ctx=ctx,
         provider="deepseek",
         base_url="https://api.deepseek.com/v1",
         api_key=api_key,
@@ -804,6 +900,7 @@ async def ask_grok(
     system: Optional[str] = None,
     max_tokens: int = 100000,
     session_id: Optional[str] = None,
+    ctx: Optional[Context] = None,
 ) -> dict:
     """Chat completion via the xAI Grok API, with multi-turn sessions.
 
@@ -841,6 +938,7 @@ async def ask_grok(
     """
     api_key = _require_env("XAI_API_KEY")
     return await _api_chat_with_session(
+        ctx=ctx,
         provider="grok",
         base_url="https://api.x.ai/v1",
         api_key=api_key,
@@ -895,6 +993,7 @@ async def ask_zai(
     system: Optional[str] = None,
     max_tokens: int = 100000,
     session_id: Optional[str] = None,
+    ctx: Optional[Context] = None,
 ) -> dict:
     """Chat completion via the z.ai (Zhipu AI) GLM API, with multi-turn sessions.
 
@@ -944,6 +1043,7 @@ async def ask_zai(
     api_key = _require_env("ZAI_API_KEY")
     jwt_token = _zai_jwt_token(api_key)
     return await _api_chat_with_session(
+        ctx=ctx,
         provider="zai",
         base_url="https://api.z.ai/api/paas/v4",
         api_key=jwt_token,
