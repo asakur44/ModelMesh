@@ -268,12 +268,51 @@ For DeepSeek/OpenRouter/Grok/Z.AI, full message history is replayed on every cal
 
 ---
 
+## Calling from a sub-agent loop
+
+Spawning a child agent (Claude sub-agent, CI runner, automated orchestrator) that itself calls modelmesh introduces a supervisor-vs-thinking-model timing trap: parent agents kill children that go silent for ~600s, but thinking-mode reasoning models (DeepSeek V4-Pro, Grok 4.20-reasoning, Kimi K2.6, GLM-5.1, Gemini 3.1 Pro Preview) routinely take 5–15 minutes per call. The parent sees silence, kills the child, and the underlying call eventually completes anyway — to no one.
+
+modelmesh handles this with three engineered fixes shipped in v0.1.2 (commits [`e1301f0`](https://github.com/asakur44/ModelMesh/commit/e1301f0) and [`794ca01`](https://github.com/asakur44/ModelMesh/commit/794ca01)):
+
+### Progress heartbeats (automatic when called via MCP)
+
+Every chat tool now accepts `ctx: Optional[Context] = None`. FastMCP injects `Context` automatically when the tool is invoked over MCP; while the slow API/CLI call awaits, a background task emits MCP progress notifications every 30s with messages like `"deepseek/deepseek-v4-pro: thinking... (60s elapsed)"`. Parent watchdogs that count progress notifications as liveness see ~20 pings over a 10-minute call instead of one silent block.
+
+Tunable via `MODELMESH_HEARTBEAT_INTERVAL_SEC` env var (default `30`). No-op when called from non-MCP code paths (no `ctx` available).
+
+### Auto disk-brief for Codex (closes ~75% rejection on long structured prompts)
+
+Codex CLI fresh sessions empirically reject ~5KB structured prompts ~75% of the time — Codex returns "send the skeleton you want filled in", returns `[]`, or hallucinates a different schema. The pattern that empirically unblocks Codex is: write the brief to a file, send Codex a one-liner "read FILE and execute". `ask_codex` now does this automatically:
+
+- Triggers when `len(prompt) > CODEX_BRIEF_THRESHOLD` (default `3000`; env-tunable) AND `session_id is None`
+- Writes the prompt to `<tempdir>/modelmesh-codex-briefs/brief-<uuid>.md`
+- Replaces the prompt with: *"Read PATH and execute. Emit outputs INLINE (do not write files; caller will persist)."*
+- Cleans up the brief file after Codex returns (best-effort)
+
+The inline-emit instruction also closes a related Codex sandbox quirk: even at `sandbox=danger-full-access`, in-Codex Write calls aren't reliably permitted by the runtime. Inline-emit avoids the issue entirely; the caller writes the output to disk after `ask_codex` returns.
+
+### Inner timeout bumped from 180s → 900s
+
+Heartbeats keep the parent watchdog alive but don't help if the inner httpx call itself times out at 3 minutes before the model finishes. `_openai_compatible_chat`'s default `timeout_sec` is now `900` (15 min) — fits the typical 5–15 min thinking-mode envelope.
+
+### Patterns that still require caller discipline
+
+Even with the engineered fixes, four orchestration patterns remain caller-side:
+
+- **Smaller agents.** For parallel fan-out, prefer 1–2 modelmesh calls per child agent. Multiple sequential calls within one child compound the watchdog risk.
+- **Inner timeout < parent watchdog.** If the parent's watchdog is 600s, set `ask_*(timeout_sec=400)` so inner failures are cleanly recoverable.
+- **Main-thread fallback.** Anticipating a stall? Fire `ask_*` directly from the parent rather than through a child sub-agent. Costs context budget, eliminates supervisor-kill.
+- **Late-write recovery.** If a child gets killed mid-call, check the expected output file 5–10 minutes later before discarding the work as failed — the underlying call may have completed and written the file after the kill.
+
+---
+
 ## Limitations / known issues
 
 - **No streaming.** Tools return final text only. Codex/Gemini agent loops can take minutes; you won't see partial output.
 - **No image input** for `ask_codex` / `ask_gemini` (CLIs support `-i`; not exposed yet).
 - **DeepSeek/OpenRouter/Grok/Z.AI token cost grows linearly per turn** — full history is resent each call. DeepSeek's context caching offsets repeat-prefix cost; OpenRouter pass-through depends on the underlying provider; xAI's caching policy varies by model; Z.AI doesn't currently surface a caching parameter on `paas/v4`.
 - **Thinking-mode models can hit `max_tokens` invisibly** if you set the cap too low — the model spends 2–6K tokens on internal reasoning before producing visible output, so `max_tokens=4096` will silently truncate real work. The `100000` default avoids this; budget at least 16K if you override.
+- **MCP progress notifications are best-effort.** Heartbeats emit via the standard MCP `notifications/progress` channel; clients that don't understand them silently ignore. There's an open issue ([modelcontextprotocol/python-sdk#953](https://github.com/modelcontextprotocol/python-sdk/issues/953)) on streamable-HTTP transport — if your MCP client uses streamable-HTTP, verify heartbeats reach the watchdog before relying on them. Stdio transport (Claude Code's default) is unaffected.
 - **Gemini IDs are not natively stable.** The CLI resumes by mtime-ordered index; we rebuild stability by scanning the chat dir. If the user clears history, IDs become invalid.
 - **Z.AI key format quirk:** keys are `id.secret` and require client-side JWT signing. The tool handles this internally; do NOT pre-sign or pass a JWT as `ZAI_API_KEY`.
 - **Windows + npm shim quirk:** the server resolves CLI paths via `shutil.which()` and explicitly closes stdin to `DEVNULL` to avoid documented hangs in `codex exec` and `gemini -p` when run as a subprocess.
