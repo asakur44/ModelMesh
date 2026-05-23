@@ -7,9 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ask_mimo`** — chat-completion backend for the Xiaomi MiMo API
+  (OpenAI-compatible, Singapore plan; default model `mimo-v2.5-pro`).
+  Reads `MIMO_API_KEY`.
+- **`ask_kimi`** — chat-completion backend for Kimi / Moonshot AI
+  (OpenAI-compatible; default model `kimi-k2.6` on the Moonshot Open
+  Platform, `api.moonshot.ai`). Reads `KIMI_API_KEY`. Passing
+  `model="kimi-for-coding"` routes to the Kimi Code *subscription*
+  endpoint (`api.kimi.com/coding`) and requires `KIMI_CODE_API_KEY`;
+  this route is guarded so it errors clearly rather than misrouting when
+  unconfigured.
+- Context-window hints and `list/delete_api_session` provider support for
+  the `mimo` and `kimi` providers.
+
 ### Changed (BREAKING)
 
-- **Project renamed: ModelMesh → MARS** (Model Adapter & Routing System).
+- **Project renamed: ModelMesh → MARS** (Model Adapter Routing System).
   Part of the Fr4ym + MARS + BCKS stack.
 - **MCP server registration name** changed from `modelmesh` to `mars`.
 - **MCP tool names** auto-derived from the server name and therefore changed
